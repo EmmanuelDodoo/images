@@ -1,16 +1,21 @@
 #![allow(dead_code, unused_imports)]
 
-use std::{default, fmt::Display, marker};
+use std::{default, fmt::Display, marker, usize};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Error {
-    NoStartOfImage,
+    StartOfImageNotFound,
+    StartOfFrameNotFound,
+    QTableNotFound,
     InvalidMarker,
     UnknownMarker(u8),
     MultipleSOI,
+    MultipleSOF,
     InvalidAPP0Marker,
     InvalidDQTMarker,
+    InvalidSOF0Marker,
     NoData,
+    DataAfterEOI,
 }
 
 impl Display for Error {
@@ -19,14 +24,19 @@ impl Display for Error {
             f,
             "JPEG Error: {}",
             match self {
-                Self::NoStartOfImage => "JPEG has no Start of Image marker".to_string(),
+                Self::StartOfImageNotFound => "JPEG has no Start of Image marker".to_string(),
+                Self::StartOfFrameNotFound => "JPEG has no Start of Frame marker".to_string(),
+                Self::QTableNotFound => "JPEG has no DQT marker".to_string(),
                 Self::NoData => "No Data after Start of Image marker".to_string(),
+                Self::DataAfterEOI => "Data found after End of Image marker".to_string(),
                 Self::InvalidMarker => "A 0xFF was found with no code after it".to_string(),
                 Self::InvalidAPP0Marker => "The APP0 marker has invalid data".to_string(),
                 Self::InvalidDQTMarker => "The DQT marker has invalid data".to_string(),
+                Self::InvalidSOF0Marker => "The baseline SOF marker has invalid data".to_string(),
                 Self::UnknownMarker(marker) =>
                     format!("An unknown marker 0x{:04X} was encountered", marker),
                 Self::MultipleSOI => "Encountered multiple Start of Image markers".to_string(),
+                Self::MultipleSOF => "Encountered multiple Start of Frame markers".to_string(),
             }
         )
     }
@@ -41,6 +51,7 @@ enum Marker {
     //Padding,
     APP0,
     DQT,
+    SOF0,
 }
 
 impl Eq for Marker {}
@@ -57,6 +68,7 @@ impl Marker {
             //Self::Padding => 0x00,
             Self::APP0 => 0xE0,
             Self::DQT => 0xDB,
+            Self::SOF0 => 0xC0,
         }
     }
 
@@ -67,15 +79,113 @@ impl Marker {
             //0x00 => Some(Self::Padding),
             0xE0 => Some(Self::APP0),
             0xDB => Some(Self::DQT),
+            0xC0 => Some(Self::SOF0),
             _ => None,
         }
     }
 
-    fn process(&self, stream: &mut impl Iterator<Item = u8>, jpeg: &mut JPEG) -> Result<(), Error> {
+    fn process(
+        &self,
+        stream: &mut impl Iterator<Item = u8>,
+        jpeg: &mut JPEG,
+    ) -> Result<Outcome, Error> {
         match self {
             //Self::Padding => Ok(()),
-            Self::SOI => Ok(()),
-            Self::EOI => Ok(()),
+            Self::SOI => Ok(Outcome::None),
+            Self::EOI => Ok(Outcome::EndOfImage),
+            Self::SOF0 => {
+                if jpeg.base_line_sof.is_set {
+                    return Err(Error::MultipleSOF);
+                }
+
+                let error = Error::InvalidSOF0Marker;
+                let length = {
+                    let x = stream.next().ok_or(error)?;
+                    let y = stream.next().ok_or(error)?;
+
+                    ((x as i16) << 8) | (y as i16)
+                };
+
+                let precision = stream.next().ok_or(error)?; // Base line SOF0 always has 8 precision
+                if precision != 0x08 {
+                    return Err(error);
+                }
+
+                let height = {
+                    let x = stream.next().ok_or(error)?;
+                    let y = stream.next().ok_or(error)?;
+
+                    ((x as u16) << 8) | (y as u16)
+                };
+
+                let width = {
+                    let x = stream.next().ok_or(error)?;
+                    let y = stream.next().ok_or(error)?;
+
+                    ((x as u16) << 8) | (y as u16)
+                };
+
+                let component_number = stream.next().ok_or(error)?;
+
+                if component_number == 0x00 || component_number == 0x02 {
+                    return Err(error);
+                }
+
+                let component_number = component_number.clamp(1, 4);
+
+                let mut baseline = BaseLineSOF::default();
+                baseline.width = width;
+                baseline.height = height;
+
+                for _ in 0..component_number {
+                    let id = stream.next().ok_or(error)? as u8;
+
+                    if id == 0x00 {
+                        return Err(error);
+                    }
+
+                    if id > 0x04 {
+                        // larger ids are not supported
+                        return Err(error);
+                    }
+
+                    let idx = (id - 1) as usize;
+
+                    let component = baseline.components.get_mut(idx).unwrap();
+
+                    if component.is_set {
+                        return Err(error);
+                    }
+
+                    let (hfactor, vfactor) = {
+                        let factor = stream.next().ok_or(error)?;
+                        (factor >> 4, factor & 0x0F)
+                    };
+
+                    let qtable = stream.next().ok_or(error)?;
+
+                    if qtable > 0x03 {
+                        return Err(error);
+                    }
+
+                    component.id = id;
+                    component.hfactor = hfactor;
+                    component.vfactor = vfactor;
+                    component.qtable = qtable;
+                    component.is_set = true;
+                }
+
+                baseline.is_set = true;
+
+                jpeg.base_line_sof = baseline;
+
+                if length - 8 - (3 * (component_number as i16)) != 0 {
+                    return Err(error);
+                }
+
+                //Make sure at least 1 component is set
+                Ok(Outcome::StartOfFrame)
+            }
             Self::DQT => {
                 let error = Error::InvalidDQTMarker;
                 let mut length = {
@@ -132,7 +242,12 @@ impl Marker {
                     jpeg.qtables[kind as usize] = qtable;
                 }
 
-                Ok(())
+                // At least one QTable Must be set
+                if jpeg.qtables.iter().find(|table| table.is_set).is_none() {
+                    return Err(Error::InvalidDQTMarker);
+                }
+
+                Ok(Outcome::QTableSet)
             }
             Self::APP0 => {
                 let error = Error::InvalidAPP0Marker;
@@ -155,7 +270,7 @@ impl Marker {
                 if !is_extension {
                     if jpeg.jfif.is_some() {
                         dbg!("Multiple non-extension JFIF segment markers encountered!");
-                        return Ok(());
+                        return Ok(Outcome::None);
                     }
                     let major_version = stream.next().ok_or(error)?;
                     let minor_version = stream.next().ok_or(error)?;
@@ -213,12 +328,12 @@ impl Marker {
                     }
                 }
 
-                Ok(())
+                Ok(Outcome::None)
             }
         }
     }
 
-    fn read(stream: &mut impl Iterator<Item = u8>, jpeg: &mut JPEG) -> Result<(), Error> {
+    fn read(stream: &mut impl Iterator<Item = u8>, jpeg: &mut JPEG) -> Result<Outcome, Error> {
         // Guaranteed by check in JPEG::new
         let marker = stream.next().unwrap();
 
@@ -290,10 +405,36 @@ impl Default for QTable {
     }
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct SOFComponent {
+    id: u8,
+    hfactor: u8,
+    vfactor: u8,
+    qtable: u8,
+    is_set: bool,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq)]
+struct BaseLineSOF {
+    height: u16,
+    width: u16,
+    components: [SOFComponent; 4],
+    is_set: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Outcome {
+    None,
+    EndOfImage,
+    QTableSet,
+    StartOfFrame,
+}
+
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct JPEG {
     jfif: Option<APP0>,
     qtables: [QTable; 4],
+    base_line_sof: BaseLineSOF,
 }
 
 impl JPEG {
@@ -301,6 +442,8 @@ impl JPEG {
         let mut stream = stream.into_iter();
 
         let mut has_soi = false;
+        let mut has_sof = false;
+        let mut has_qtable = false;
 
         // Advance until SOI
         while let Some(byte) = stream.next() {
@@ -311,7 +454,7 @@ impl JPEG {
         }
 
         if !has_soi {
-            return Err(Error::NoStartOfImage);
+            return Err(Error::StartOfImageNotFound);
         }
 
         let mut stream = stream.peekable();
@@ -320,20 +463,44 @@ impl JPEG {
             return Err(Error::NoData);
         }
 
+        // TODO: Might want to implement default for JPEG later
         let mut jpeg = JPEG {
             jfif: None,
             qtables: [QTable::default(); 4],
+            base_line_sof: BaseLineSOF::default(),
         };
 
         // Advance until next marker
         while let Some(byte) = stream.next() {
             if byte == 0xFF {
                 if stream.peek().is_some() {
-                    let _res = Marker::read(&mut stream, &mut jpeg)?;
+                    match Marker::read(&mut stream, &mut jpeg)? {
+                        Outcome::EndOfImage => {
+                            if stream.peek().is_some() {
+                                return Err(Error::DataAfterEOI);
+                            } else {
+                                break;
+                            }
+                        }
+                        Outcome::StartOfFrame => {
+                            has_sof = true;
+                        }
+                        Outcome::QTableSet => {
+                            has_qtable = true;
+                        }
+                        Outcome::None => {}
+                    };
                 } else {
                     return Err(Error::InvalidMarker);
                 }
             }
+        }
+
+        if !has_sof {
+            return Err(Error::StartOfFrameNotFound);
+        }
+        if !has_qtable {
+            return Err(Error::QTableNotFound);
         }
 
         // need to check if at least 1 QTable is set
