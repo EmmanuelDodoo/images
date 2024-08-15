@@ -9,6 +9,7 @@ pub enum Error {
     UnknownMarker(u8),
     MultipleSOI,
     InvalidAPP0Marker,
+    InvalidDQTMarker,
     NoData,
 }
 
@@ -22,6 +23,7 @@ impl Display for Error {
                 Self::NoData => "No Data after Start of Image marker".to_string(),
                 Self::InvalidMarker => "A 0xFF was found with no code after it".to_string(),
                 Self::InvalidAPP0Marker => "The APP0 marker has invalid data".to_string(),
+                Self::InvalidDQTMarker => "The DQT marker has invalid data".to_string(),
                 Self::UnknownMarker(marker) =>
                     format!("An unknown marker 0x{:04X} was encountered", marker),
                 Self::MultipleSOI => "Encountered multiple Start of Image markers".to_string(),
@@ -74,7 +76,64 @@ impl Marker {
             //Self::Padding => Ok(()),
             Self::SOI => Ok(()),
             Self::EOI => Ok(()),
-            Self::DQT => Ok(()),
+            Self::DQT => {
+                let error = Error::InvalidDQTMarker;
+                let mut length = {
+                    let x = stream.next().ok_or(error)?;
+                    let y = stream.next().ok_or(error)?;
+
+                    let length = ((x as i16) << 8) | (y as i16);
+
+                    length - 2
+                };
+
+                // Accumulate tables
+                while length > 0 {
+                    let id = stream.next().ok_or(error)?;
+                    length -= 1;
+
+                    let (is_extended, kind) = { (id >> 4 == 1, id & 0x0F) };
+
+                    let qtable_type = match kind {
+                        0x00 => QTableType::Luminance,
+                        0x01 => QTableType::Chrominance,
+                        0x02 | 3 => QTableType::Other,
+                        _ => return Err(error),
+                    };
+
+                    let mut data = [0; 64];
+
+                    if is_extended {
+                        for i in 0..63 {
+                            let x = stream.next().ok_or(error)?;
+                            let y = stream.next().ok_or(error)?;
+
+                            data[QTable::ZIGZAG[i] as usize] = ((x as u16) << 8) | (y as u16);
+                        }
+
+                        length -= 128;
+                    } else {
+                        for i in 0..63 {
+                            let byte = stream.next().ok_or(error)?;
+                            data[QTable::ZIGZAG[i] as usize] = byte as u16;
+                        }
+
+                        length -= 64;
+                    }
+
+                    let qtable = QTable {
+                        is_set: true,
+                        is_extended_mode: is_extended,
+                        kind: qtable_type,
+                        table: data,
+                    };
+
+                    // Kind being out of range should be caught by qtable_type
+                    jpeg.qtables[kind as usize] = qtable;
+                }
+
+                Ok(())
+            }
             Self::APP0 => {
                 let error = Error::InvalidAPP0Marker;
 
@@ -197,9 +256,44 @@ struct APP0 {
     thumbnail_data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum QTableType {
+    Luminance,
+    Chrominance,
+    Other,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct QTable {
+    is_set: bool,
+    is_extended_mode: bool,
+    kind: QTableType,
+    table: [u16; 64],
+}
+
+impl QTable {
+    const ZIGZAG: [u16; 64] = [
+        0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27,
+        20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
+        58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+    ];
+}
+
+impl Default for QTable {
+    fn default() -> Self {
+        Self {
+            is_set: false,
+            is_extended_mode: false,
+            kind: QTableType::Other,
+            table: [0; 64],
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct JPEG {
     jfif: Option<APP0>,
+    qtables: [QTable; 4],
 }
 
 impl JPEG {
@@ -226,7 +320,10 @@ impl JPEG {
             return Err(Error::NoData);
         }
 
-        let mut jpeg = JPEG { jfif: None };
+        let mut jpeg = JPEG {
+            jfif: None,
+            qtables: [QTable::default(); 4],
+        };
 
         // Advance until next marker
         while let Some(byte) = stream.next() {
@@ -238,6 +335,8 @@ impl JPEG {
                 }
             }
         }
+
+        // need to check if at least 1 QTable is set
 
         Ok(jpeg)
     }
