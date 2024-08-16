@@ -6,6 +6,7 @@ use std::{default, fmt::Display, marker, usize};
 pub enum SOF0MarkerError {
     MissingNextByte,
     InvalidComponentNumber,
+    ZeroDimensions,
     InvalidComponentID,
     ComponentAlreadySet,
     UnsupportedComponentQTable,
@@ -26,6 +27,7 @@ impl Display for SOF0MarkerError {
                     "Stated Marker Length does not match actual component length",
                 Self::UnsupportedComponentQTable => "Component uses unsupported QTable",
                 Self::InvalidPrecision => "Marker has invalid precision",
+                Self::ZeroDimensions => "Marker has width or height set to zero",
                 Self::MissingNextByte => "Missing next byte in marker",
                 Self::InvalidComponentNumber => "Number of components is invalid or unsupported",
                 Self::NoComponentSet => "No component was set by marker",
@@ -323,6 +325,10 @@ impl Marker {
 
                     ((x as u16) << 8) | (y as u16)
                 };
+
+                if width == 0 || height == 0 {
+                    return throw(SOF0MarkerError::ZeroDimensions);
+                }
 
                 let component_number = stream.next().ok_or(error)?;
 
