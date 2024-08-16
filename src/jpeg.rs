@@ -11,6 +11,7 @@ pub enum SOF0MarkerError {
     UnsupportedComponentQTable,
     InvalidMarkerLength,
     InvalidPrecision,
+    NoComponentSet,
 }
 
 impl Display for SOF0MarkerError {
@@ -27,6 +28,7 @@ impl Display for SOF0MarkerError {
                 Self::InvalidPrecision => "Marker has invalid precision",
                 Self::MissingNextByte => "Missing next byte in marker",
                 Self::InvalidComponentNumber => "Number of components is invalid or unsupported",
+                Self::NoComponentSet => "No component was set by marker",
             }
         )
     }
@@ -63,6 +65,7 @@ pub enum DHTError {
     InvalidMarkerLength,
     InvalidTableId,
     InvalidSymbolsLength,
+    NoTableSet,
 }
 
 impl Display for DHTError {
@@ -75,6 +78,7 @@ impl Display for DHTError {
                 Self::InvalidMarkerLength => "Stated marker length does not match actual length",
                 Self::InvalidTableId => "A table has an invalid table ID",
                 Self::InvalidSymbolsLength => "A table has more symbols than allowed",
+                Self::NoTableSet => "No Huffman table was set by marker",
             }
         )
     }
@@ -236,6 +240,16 @@ impl Marker {
                     length -= 17 + (total_symbols as i16);
                 }
 
+                if jpeg
+                    .huffman_tables_ac
+                    .iter()
+                    .chain(jpeg.huffman_tables_dc.iter())
+                    .find(|htable| htable.is_set)
+                    .is_none()
+                {
+                    return throw(DHTError::NoTableSet);
+                }
+
                 if length != 0 {
                     return throw(DHTError::InvalidMarkerLength);
                 }
@@ -377,6 +391,16 @@ impl Marker {
                 }
 
                 //Make sure at least 1 component is set
+                if jpeg
+                    .base_line_sof
+                    .components
+                    .iter()
+                    .find(|component| component.is_set)
+                    .is_none()
+                {
+                    return throw(SOF0MarkerError::NoComponentSet);
+                }
+
                 Ok(Outcome::StartOfFrame)
             }
             Self::DQT => {
