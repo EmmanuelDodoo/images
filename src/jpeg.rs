@@ -89,11 +89,49 @@ impl Display for DHTError {
 impl std::error::Error for DHTError {}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SOSError {
+    MissingNextByte,
+    InvalidMarkerLength,
+    InvalidOrder,
+    InvalidComponentNumber,
+    InvalidComponentID,
+    DuplicateComponentID,
+    InvalidHuffmanTableID,
+    InvalidSpectralSelection,
+    InvalidSuccesiveApproximation,
+}
+
+impl Display for SOSError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Start of Scan Error: {}.",
+            match self {
+                Self::MissingNextByte => "Missing next byte in marker",
+                Self::InvalidMarkerLength => "Stated marker length does not match actual length",
+                Self::InvalidOrder => "Start of Scan reached before Start of Frame",
+                Self::InvalidComponentNumber => "Invalid number of components",
+                Self::InvalidComponentID => "Invalid component ID",
+                Self::DuplicateComponentID => "Multiple components have the same id",
+                Self::InvalidHuffmanTableID => "A Huffman table id greater than 3 was reached",
+                Self::InvalidSpectralSelection =>
+                    "Either the starting or ending spectral selection is out of bounds",
+                Self::InvalidSuccesiveApproximation =>
+                    "The successive approximation is out of bounds",
+            }
+        )
+    }
+}
+
+impl std::error::Error for SOSError {}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Error {
     StartOfImageNotFound,
     StartOfFrameNotFound,
     QTableNotFound,
     HTableNotFound,
+    SOSNotFound,
     InvalidMarker,
     UnknownMarker(u8),
     MultipleSOI,
@@ -102,6 +140,7 @@ pub enum Error {
     InvalidDQTMarker(DQTError),
     InvalidSOF0Marker(SOF0MarkerError),
     InvalidDHTMarker(DHTError),
+    InvalidSOSMarker(SOSError),
     NoData,
     DataAfterEOI,
     InvalidRestartIntervalMarker,
@@ -117,6 +156,7 @@ impl Display for Error {
                 Self::StartOfFrameNotFound => "JPEG has no Start of Frame marker".to_string(),
                 Self::QTableNotFound => "JPEG has no DQT marker".to_string(),
                 Self::HTableNotFound => "JPEG has no DHT marker".to_string(),
+                Self::SOSNotFound => "JPEG has no SOS marker".to_string(),
                 Self::NoData => "No Data after Start of Image marker".to_string(),
                 Self::DataAfterEOI => "Data found after End of Image marker".to_string(),
                 Self::InvalidMarker => "A 0xFF was found with no code after it".to_string(),
@@ -128,6 +168,8 @@ impl Display for Error {
                     format!("The baseline SOF marker has invalid data. {}", source),
                 Self::InvalidDHTMarker(source) =>
                     format!("The DHT marker has invalid data. {}", source),
+                Self::InvalidSOSMarker(source) =>
+                    format!("The SOS marker has invalid data. {}", source),
                 Self::UnknownMarker(marker) =>
                     format!("An unknown marker 0x{:04X} was encountered", marker),
                 Self::MultipleSOI => "Encountered multiple Start of Image markers".to_string(),
@@ -143,6 +185,7 @@ impl std::error::Error for Error {
             Self::InvalidSOF0Marker(source) => Some(source),
             Self::InvalidDQTMarker(source) => Some(source),
             Self::InvalidDHTMarker(source) => Some(source),
+            Self::InvalidSOSMarker(source) => Some(source),
             _ => None,
         }
     }
@@ -159,6 +202,7 @@ enum Marker {
     DRI,
     APPN,
     DHT,
+    SOS,
 }
 
 impl Eq for Marker {}
@@ -186,6 +230,7 @@ impl Marker {
             0xC0 => Some(Self::SOF0),
             0xC4 => Some(Self::DHT),
             0xDD => Some(Self::DRI),
+            0xDA => Some(Self::SOS),
             0xEE..=0xEF => Some(Self::APPN),
             _ => None,
         }
@@ -200,6 +245,85 @@ impl Marker {
             //Self::Padding => Ok(()),
             Self::SOI => Ok(Outcome::None),
             Self::EOI => Ok(Outcome::EndOfImage),
+            Self::SOS => {
+                let error = Error::InvalidSOSMarker(SOSError::MissingNextByte);
+
+                fn throw(error: SOSError) -> Result<Outcome, Error> {
+                    return Err(Error::InvalidSOSMarker(error));
+                }
+
+                if jpeg
+                    .components
+                    .iter()
+                    .find(|component| component.is_used_sof)
+                    .is_none()
+                {
+                    return throw(SOSError::InvalidOrder);
+                }
+
+                let length = Self::marker_length(stream, error)? as i16;
+
+                let component_number = stream.next().ok_or(error)?;
+
+                if component_number == 0x00 || component_number > 0x04 {
+                    return throw(SOSError::InvalidComponentNumber);
+                }
+
+                for _ in 0..component_number {
+                    let mut component_id = stream.next().ok_or(error)?;
+
+                    if jpeg.zero_based_component_id {
+                        component_id += 1;
+                    }
+
+                    if component_id > 0x04 {
+                        return throw(SOSError::InvalidComponentID);
+                    }
+
+                    let component = &mut jpeg.components[(component_id as usize) - 1];
+
+                    if component.is_used_sos {
+                        return throw(SOSError::DuplicateComponentID);
+                    }
+
+                    component.is_used_sos = true;
+
+                    let htable_ids = stream.next().ok_or(error)?;
+                    let dc_id = htable_ids >> 4;
+                    let ac_id = htable_ids & 0x0F;
+
+                    if dc_id > 0x03 || ac_id > 0x03 {
+                        return throw(SOSError::InvalidHuffmanTableID);
+                    }
+                }
+
+                let selection_start = stream.next().ok_or(error)?;
+                let selection_end = stream.next().ok_or(error)?;
+
+                if selection_start > 0x3F || selection_end > 0x3F {
+                    return throw(SOSError::InvalidSpectralSelection);
+                }
+
+                jpeg.start_of_selection = selection_start;
+                jpeg.end_of_selection = selection_end;
+
+                let approximation = stream.next().ok_or(error)?;
+                let high = approximation >> 4;
+                let low = approximation & 0x0F;
+
+                if high > 13 {
+                    return throw(SOSError::InvalidSuccesiveApproximation);
+                }
+
+                jpeg.successive_approximation_high = high;
+                jpeg.successive_approximation_low = low;
+
+                if length - 6 - 2 * (component_number as i16) != 0 {
+                    return throw(SOSError::InvalidMarkerLength);
+                }
+
+                Ok(Outcome::StartOfScan)
+            }
             Self::DHT => {
                 let error = Error::InvalidDHTMarker(DHTError::MissingNextByte);
                 fn throw(error: DHTError) -> Result<Outcome, Error> {
@@ -365,7 +489,7 @@ impl Marker {
 
                     let component = jpeg.components.get_mut(idx).unwrap();
 
-                    if component.is_set {
+                    if component.is_used_sof {
                         return throw(SOF0MarkerError::ComponentAlreadySet);
                     }
 
@@ -384,7 +508,7 @@ impl Marker {
                     component.hfactor = hfactor;
                     component.vfactor = vfactor;
                     component.qtable = qtable;
-                    component.is_set = true;
+                    component.is_used_sof = true;
                 }
 
                 jpeg.is_sof_set = true;
@@ -397,7 +521,7 @@ impl Marker {
                 if jpeg
                     .components
                     .iter()
-                    .find(|component| component.is_set)
+                    .find(|component| component.is_used_sof)
                     .is_none()
                 {
                     return throw(SOF0MarkerError::NoComponentSet);
@@ -621,7 +745,10 @@ struct ColorComponent {
     hfactor: u8,
     vfactor: u8,
     qtable: u8,
-    is_set: bool,
+    huffman_table_ac_id: u8,
+    huffman_table_dc_id: u8,
+    is_used_sof: bool,
+    is_used_sos: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -648,6 +775,7 @@ enum Outcome {
     QTableSet,
     StartOfFrame,
     HuffmanTable,
+    StartOfScan,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -662,6 +790,11 @@ pub struct JPEG {
     is_sof_set: bool,
     height: u16,
     width: u16,
+    start_of_selection: u8,
+    end_of_selection: u8,
+    successive_approximation_high: u8,
+    successive_approximation_low: u8,
+    huffman_data: Vec<u8>,
 }
 
 impl Default for JPEG {
@@ -677,6 +810,11 @@ impl Default for JPEG {
             is_sof_set: false,
             height: 0,
             width: 0,
+            start_of_selection: 0,
+            end_of_selection: 63,
+            successive_approximation_low: 0,
+            successive_approximation_high: 0,
+            huffman_data: Vec::default(),
         }
     }
 }
@@ -689,6 +827,7 @@ impl JPEG {
         let mut has_sof = false;
         let mut has_qtable = false;
         let mut has_htable = false;
+        let mut has_sos = false;
 
         // Advance until SOI
         while let Some(byte) = stream.next() {
@@ -731,6 +870,10 @@ impl JPEG {
                         Outcome::HuffmanTable => {
                             has_htable = true;
                         }
+                        Outcome::StartOfScan => {
+                            has_sos = true;
+                             
+                        }
                         Outcome::None => {}
                     };
                 } else {
@@ -748,6 +891,10 @@ impl JPEG {
 
         if !has_htable {
             return Err(Error::HTableNotFound);
+        }
+
+        if !has_sos {
+            return Err(Error::SOSNotFound);
         }
 
         Ok(jpeg)
