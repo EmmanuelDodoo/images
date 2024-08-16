@@ -286,7 +286,7 @@ impl Marker {
                     let mut data = [0; 64];
 
                     if is_extended {
-                        for i in 0..63 {
+                        for i in 0..64 {
                             let x = stream.next().ok_or(error)?;
                             let y = stream.next().ok_or(error)?;
 
@@ -295,7 +295,7 @@ impl Marker {
 
                         length -= 128;
                     } else {
-                        for i in 0..63 {
+                        for i in 0..64 {
                             let byte = stream.next().ok_or(error)?;
                             data[QTable::ZIGZAG[i] as usize] = byte as u16;
                         }
