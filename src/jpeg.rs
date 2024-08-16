@@ -3,6 +3,61 @@
 use std::{default, fmt::Display, marker, usize};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum SOF0MarkerError {
+    MissingNextByte,
+    InvalidComponentNumber,
+    InvalidComponentID,
+    ComponentAlreadySet,
+    UnsupportedComponentQTable,
+    InvalidMarkerLength,
+    InvalidPrecision,
+}
+
+impl Display for SOF0MarkerError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Start of Frame Error: {}",
+            match self {
+                Self::InvalidComponentID => "Component has invalid or unsupported id",
+                Self::ComponentAlreadySet => "Tried to overwrite set component",
+                Self::InvalidMarkerLength =>
+                    "Stated Marker Length does not match actual component length",
+                Self::UnsupportedComponentQTable => "Component uses unsupported QTable",
+                Self::InvalidPrecision => "Marker has invalid precision",
+                Self::MissingNextByte => "Missing next byte in marker",
+                Self::InvalidComponentNumber => "Number of components is invalid or unsupported",
+            }
+        )
+    }
+}
+
+impl std::error::Error for SOF0MarkerError {}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DQTError {
+    MissingNextByte,
+    InvalidTableDestination,
+    NoTableSet,
+}
+
+impl Display for DQTError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Define Quantization Table Error: {}",
+            match self {
+                Self::MissingNextByte => "Missing next byte in marker",
+                Self::InvalidTableDestination => "QTable Destination is greater than 0x03",
+                Self::NoTableSet => "Marker did not set any QTable",
+            }
+        )
+    }
+}
+
+impl std::error::Error for DQTError {}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Error {
     StartOfImageNotFound,
     StartOfFrameNotFound,
@@ -12,8 +67,8 @@ pub enum Error {
     MultipleSOI,
     MultipleSOF,
     InvalidAPP0Marker,
-    InvalidDQTMarker,
-    InvalidSOF0Marker,
+    InvalidDQTMarker(DQTError),
+    InvalidSOF0Marker(SOF0MarkerError),
     NoData,
     DataAfterEOI,
 }
@@ -31,8 +86,10 @@ impl Display for Error {
                 Self::DataAfterEOI => "Data found after End of Image marker".to_string(),
                 Self::InvalidMarker => "A 0xFF was found with no code after it".to_string(),
                 Self::InvalidAPP0Marker => "The APP0 marker has invalid data".to_string(),
-                Self::InvalidDQTMarker => "The DQT marker has invalid data".to_string(),
-                Self::InvalidSOF0Marker => "The baseline SOF marker has invalid data".to_string(),
+                Self::InvalidDQTMarker(source) =>
+                    format!("The DQT marker has invalid data. {}", source),
+                Self::InvalidSOF0Marker(source) =>
+                    format!("The baseline SOF marker has invalid data. {}", source),
                 Self::UnknownMarker(marker) =>
                     format!("An unknown marker 0x{:04X} was encountered", marker),
                 Self::MultipleSOI => "Encountered multiple Start of Image markers".to_string(),
@@ -42,7 +99,15 @@ impl Display for Error {
     }
 }
 
-impl std::error::Error for Error {}
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::InvalidSOF0Marker(source) => Some(source),
+            Self::InvalidDQTMarker(source) => Some(source),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Marker {
@@ -98,7 +163,12 @@ impl Marker {
                     return Err(Error::MultipleSOF);
                 }
 
-                let error = Error::InvalidSOF0Marker;
+                fn throw(error: SOF0MarkerError) -> Result<Outcome, Error> {
+                    return Err(Error::InvalidSOF0Marker(error));
+                }
+
+                let error = Error::InvalidSOF0Marker(SOF0MarkerError::MissingNextByte);
+
                 let length = {
                     let x = stream.next().ok_or(error)?;
                     let y = stream.next().ok_or(error)?;
@@ -108,7 +178,7 @@ impl Marker {
 
                 let precision = stream.next().ok_or(error)?; // Base line SOF0 always has 8 precision
                 if precision != 0x08 {
-                    return Err(error);
+                    return throw(SOF0MarkerError::InvalidPrecision);
                 }
 
                 let height = {
@@ -128,7 +198,7 @@ impl Marker {
                 let component_number = stream.next().ok_or(error)?;
 
                 if component_number == 0x00 || component_number == 0x02 {
-                    return Err(error);
+                    return throw(SOF0MarkerError::InvalidComponentNumber);
                 }
 
                 let component_number = component_number.clamp(1, 4);
@@ -141,12 +211,12 @@ impl Marker {
                     let id = stream.next().ok_or(error)? as u8;
 
                     if id == 0x00 {
-                        return Err(error);
+                        return throw(SOF0MarkerError::InvalidComponentID);
                     }
 
                     if id > 0x04 {
                         // larger ids are not supported
-                        return Err(error);
+                        return throw(SOF0MarkerError::InvalidComponentID);
                     }
 
                     let idx = (id - 1) as usize;
@@ -154,7 +224,7 @@ impl Marker {
                     let component = baseline.components.get_mut(idx).unwrap();
 
                     if component.is_set {
-                        return Err(error);
+                        return throw(SOF0MarkerError::ComponentAlreadySet);
                     }
 
                     let (hfactor, vfactor) = {
@@ -165,7 +235,7 @@ impl Marker {
                     let qtable = stream.next().ok_or(error)?;
 
                     if qtable > 0x03 {
-                        return Err(error);
+                        return throw(SOF0MarkerError::UnsupportedComponentQTable);
                     }
 
                     component.id = id;
@@ -180,14 +250,14 @@ impl Marker {
                 jpeg.base_line_sof = baseline;
 
                 if length - 8 - (3 * (component_number as i16)) != 0 {
-                    return Err(error);
+                    return throw(SOF0MarkerError::InvalidMarkerLength);
                 }
 
                 //Make sure at least 1 component is set
                 Ok(Outcome::StartOfFrame)
             }
             Self::DQT => {
-                let error = Error::InvalidDQTMarker;
+                let error = Error::InvalidDQTMarker(DQTError::MissingNextByte);
                 let mut length = {
                     let x = stream.next().ok_or(error)?;
                     let y = stream.next().ok_or(error)?;
@@ -208,7 +278,9 @@ impl Marker {
                         0x00 => QTableType::Luminance,
                         0x01 => QTableType::Chrominance,
                         0x02 | 3 => QTableType::Other,
-                        _ => return Err(error),
+                        _ => {
+                            return Err(Error::InvalidDQTMarker(DQTError::InvalidTableDestination))
+                        }
                     };
 
                     let mut data = [0; 64];
@@ -244,7 +316,7 @@ impl Marker {
 
                 // At least one QTable Must be set
                 if jpeg.qtables.iter().find(|table| table.is_set).is_none() {
-                    return Err(Error::InvalidDQTMarker);
+                    return Err(Error::InvalidDQTMarker(DQTError::NoTableSet));
                 }
 
                 Ok(Outcome::QTableSet)
