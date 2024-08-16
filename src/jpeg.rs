@@ -293,7 +293,7 @@ impl Marker {
                 Ok(Outcome::None)
             }
             Self::SOF0 => {
-                if jpeg.base_line_sof.is_set {
+                if jpeg.is_sof_set {
                     return Err(Error::MultipleSOF);
                 }
 
@@ -332,9 +332,8 @@ impl Marker {
 
                 let component_number = component_number.clamp(1, 4);
 
-                let mut baseline = BaseLineSOF::default();
-                baseline.width = width;
-                baseline.height = height;
+                jpeg.width = width;
+                jpeg.height = height;
 
                 for _ in 0..component_number {
                     let mut id = stream.next().ok_or(error)? as u8;
@@ -358,7 +357,7 @@ impl Marker {
 
                     let idx = (id - 1) as usize;
 
-                    let component = baseline.components.get_mut(idx).unwrap();
+                    let component = jpeg.components.get_mut(idx).unwrap();
 
                     if component.is_set {
                         return throw(SOF0MarkerError::ComponentAlreadySet);
@@ -382,9 +381,7 @@ impl Marker {
                     component.is_set = true;
                 }
 
-                baseline.is_set = true;
-
-                jpeg.base_line_sof = baseline;
+                jpeg.is_sof_set = true;
 
                 if length - 8 - (3 * (component_number as i16)) != 0 {
                     return throw(SOF0MarkerError::InvalidMarkerLength);
@@ -392,7 +389,6 @@ impl Marker {
 
                 //Make sure at least 1 component is set
                 if jpeg
-                    .base_line_sof
                     .components
                     .iter()
                     .find(|component| component.is_set)
@@ -614,19 +610,11 @@ impl Default for QTable {
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq)]
-struct SOFComponent {
+struct ColorComponent {
     id: u8,
     hfactor: u8,
     vfactor: u8,
     qtable: u8,
-    is_set: bool,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq)]
-struct BaseLineSOF {
-    height: u16,
-    width: u16,
-    components: [SOFComponent; 4],
     is_set: bool,
 }
 
@@ -660,11 +648,14 @@ enum Outcome {
 pub struct JPEG {
     jfif: Option<APP0>,
     qtables: [QTable; 4],
-    base_line_sof: BaseLineSOF,
     restart_interval: u16,
     zero_based_component_id: bool,
     huffman_tables_dc: [HuffmanTable; 4],
     huffman_tables_ac: [HuffmanTable; 4],
+    components: [ColorComponent; 4],
+    is_sof_set: bool,
+    height: u16,
+    width: u16,
 }
 
 impl Default for JPEG {
@@ -672,11 +663,14 @@ impl Default for JPEG {
         Self {
             jfif: None,
             qtables: [QTable::default(); 4],
-            base_line_sof: BaseLineSOF::default(),
             restart_interval: 0,
             zero_based_component_id: false,
             huffman_tables_dc: [HuffmanTable::default(); 4],
             huffman_tables_ac: [HuffmanTable::default(); 4],
+            components: [ColorComponent::default(); 4],
+            is_sof_set: false,
+            height: 0,
+            width: 0,
         }
     }
 }
