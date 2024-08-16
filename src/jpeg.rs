@@ -71,6 +71,7 @@ pub enum Error {
     InvalidSOF0Marker(SOF0MarkerError),
     NoData,
     DataAfterEOI,
+    InvalidRestartIntervalMarker,
 }
 
 impl Display for Error {
@@ -86,6 +87,7 @@ impl Display for Error {
                 Self::DataAfterEOI => "Data found after End of Image marker".to_string(),
                 Self::InvalidMarker => "A 0xFF was found with no code after it".to_string(),
                 Self::InvalidAPP0Marker => "The APP0 marker has invalid data".to_string(),
+                Self::InvalidRestartIntervalMarker => "The DRI marker has invalid data".to_string(),
                 Self::InvalidDQTMarker(source) =>
                     format!("The DQT marker has invalid data. {}", source),
                 Self::InvalidSOF0Marker(source) =>
@@ -117,6 +119,7 @@ enum Marker {
     APP0,
     DQT,
     SOF0,
+    DRI,
 }
 
 impl Eq for Marker {}
@@ -134,6 +137,7 @@ impl Marker {
             Self::APP0 => 0xE0,
             Self::DQT => 0xDB,
             Self::SOF0 => 0xC0,
+            Self::DRI => 0xDD,
         }
     }
 
@@ -145,6 +149,7 @@ impl Marker {
             0xE0 => Some(Self::APP0),
             0xDB => Some(Self::DQT),
             0xC0 => Some(Self::SOF0),
+            0xDD => Some(Self::DRI),
             _ => None,
         }
     }
@@ -158,6 +163,30 @@ impl Marker {
             //Self::Padding => Ok(()),
             Self::SOI => Ok(Outcome::None),
             Self::EOI => Ok(Outcome::EndOfImage),
+            Self::DRI => {
+                let error = Error::InvalidRestartIntervalMarker;
+                let length = {
+                    let x = stream.next().ok_or(error)?;
+                    let y = stream.next().ok_or(error)?;
+
+                    ((x as u16) << 8) | (y as u16)
+                };
+
+                if length != 0x04 {
+                    return Err(Error::InvalidRestartIntervalMarker);
+                }
+
+                let rsi = {
+                    let x = stream.next().ok_or(error)?;
+                    let y = stream.next().ok_or(error)?;
+
+                    ((x as u16) << 8) | (y as u16)
+                };
+
+                jpeg.restart_interval = rsi;
+
+                Ok(Outcome::None)
+            }
             Self::SOF0 => {
                 if jpeg.base_line_sof.is_set {
                     return Err(Error::MultipleSOF);
@@ -507,6 +536,7 @@ pub struct JPEG {
     jfif: Option<APP0>,
     qtables: [QTable; 4],
     base_line_sof: BaseLineSOF,
+    restart_interval: u16,
 }
 
 impl JPEG {
@@ -540,6 +570,7 @@ impl JPEG {
             jfif: None,
             qtables: [QTable::default(); 4],
             base_line_sof: BaseLineSOF::default(),
+            restart_interval: 0,
         };
 
         // Advance until next marker
