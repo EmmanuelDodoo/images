@@ -120,6 +120,7 @@ enum Marker {
     DQT,
     SOF0,
     DRI,
+    APPN,
 }
 
 impl Eq for Marker {}
@@ -128,18 +129,6 @@ impl Marker {
     const HEX_SOI: u8 = 0xD8;
     const HEX_EOI: u8 = 0xD9;
     const HEX_PADDING: u8 = 0x00;
-
-    fn hex(&self) -> u8 {
-        match self {
-            Self::SOI => 0xD8,
-            Self::EOI => 0xD9,
-            //Self::Padding => 0x00,
-            Self::APP0 => 0xE0,
-            Self::DQT => 0xDB,
-            Self::SOF0 => 0xC0,
-            Self::DRI => 0xDD,
-        }
-    }
 
     fn marker(byte: u8) -> Option<Self> {
         match byte {
@@ -150,6 +139,7 @@ impl Marker {
             0xDB => Some(Self::DQT),
             0xC0 => Some(Self::SOF0),
             0xDD => Some(Self::DRI),
+            0xEE..=0xEF => Some(Self::APPN),
             _ => None,
         }
     }
@@ -163,6 +153,23 @@ impl Marker {
             //Self::Padding => Ok(()),
             Self::SOI => Ok(Outcome::None),
             Self::EOI => Ok(Outcome::EndOfImage),
+            Self::APPN => {
+                let error = Error::InvalidMarker;
+                let length = {
+                    let x = stream.next().ok_or(error)?;
+                    let y = stream.next().ok_or(error)?;
+
+                    let len = ((x as i16) << 8) | (y as i16);
+
+                    len - 2
+                };
+
+                for _ in 0..length {
+                    stream.next();
+                }
+
+                Ok(Outcome::None)
+            }
             Self::DRI => {
                 let error = Error::InvalidRestartIntervalMarker;
                 let length = {
