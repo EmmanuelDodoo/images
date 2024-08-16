@@ -244,7 +244,15 @@ impl Marker {
                 baseline.height = height;
 
                 for _ in 0..component_number {
-                    let id = stream.next().ok_or(error)? as u8;
+                    let mut id = stream.next().ok_or(error)? as u8;
+
+                    if id == 0x00 {
+                        jpeg.zero_based_component_id = true;
+                    }
+
+                    if jpeg.zero_based_component_id {
+                        id += 1;
+                    }
 
                     if id == 0x00 {
                         return throw(SOF0MarkerError::InvalidComponentID);
@@ -544,6 +552,7 @@ pub struct JPEG {
     qtables: [QTable; 4],
     base_line_sof: BaseLineSOF,
     restart_interval: u16,
+    zero_based_component_id: bool,
 }
 
 impl JPEG {
@@ -578,6 +587,7 @@ impl JPEG {
             qtables: [QTable::default(); 4],
             base_line_sof: BaseLineSOF::default(),
             restart_interval: 0,
+            zero_based_component_id: false,
         };
 
         // Advance until next marker
