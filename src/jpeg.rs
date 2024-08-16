@@ -58,10 +58,36 @@ impl Display for DQTError {
 impl std::error::Error for DQTError {}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DHTError {
+    MissingNextByte,
+    InvalidMarkerLength,
+    InvalidTableId,
+    InvalidSymbolsLength,
+}
+
+impl Display for DHTError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Define Huffman Table Error: {}.",
+            match self {
+                Self::MissingNextByte => "Missing next byte in marker",
+                Self::InvalidMarkerLength => "Stated marker length does not match actual length",
+                Self::InvalidTableId => "A table has an invalid table ID",
+                Self::InvalidSymbolsLength => "A table has more symbols than allowed",
+            }
+        )
+    }
+}
+
+impl std::error::Error for DHTError {}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Error {
     StartOfImageNotFound,
     StartOfFrameNotFound,
     QTableNotFound,
+    HTableNotFound,
     InvalidMarker,
     UnknownMarker(u8),
     MultipleSOI,
@@ -69,6 +95,7 @@ pub enum Error {
     InvalidAPP0Marker,
     InvalidDQTMarker(DQTError),
     InvalidSOF0Marker(SOF0MarkerError),
+    InvalidDHTMarker(DHTError),
     NoData,
     DataAfterEOI,
     InvalidRestartIntervalMarker,
@@ -83,6 +110,7 @@ impl Display for Error {
                 Self::StartOfImageNotFound => "JPEG has no Start of Image marker".to_string(),
                 Self::StartOfFrameNotFound => "JPEG has no Start of Frame marker".to_string(),
                 Self::QTableNotFound => "JPEG has no DQT marker".to_string(),
+                Self::HTableNotFound => "JPEG has no DHT marker".to_string(),
                 Self::NoData => "No Data after Start of Image marker".to_string(),
                 Self::DataAfterEOI => "Data found after End of Image marker".to_string(),
                 Self::InvalidMarker => "A 0xFF was found with no code after it".to_string(),
@@ -92,6 +120,8 @@ impl Display for Error {
                     format!("The DQT marker has invalid data. {}", source),
                 Self::InvalidSOF0Marker(source) =>
                     format!("The baseline SOF marker has invalid data. {}", source),
+                Self::InvalidDHTMarker(source) =>
+                    format!("The DHT marker has invalid data. {}", source),
                 Self::UnknownMarker(marker) =>
                     format!("An unknown marker 0x{:04X} was encountered", marker),
                 Self::MultipleSOI => "Encountered multiple Start of Image markers".to_string(),
@@ -106,6 +136,7 @@ impl std::error::Error for Error {
         match self {
             Self::InvalidSOF0Marker(source) => Some(source),
             Self::InvalidDQTMarker(source) => Some(source),
+            Self::InvalidDHTMarker(source) => Some(source),
             _ => None,
         }
     }
@@ -121,6 +152,7 @@ enum Marker {
     SOF0,
     DRI,
     APPN,
+    DHT,
 }
 
 impl Eq for Marker {}
@@ -130,6 +162,14 @@ impl Marker {
     const HEX_EOI: u8 = 0xD9;
     const HEX_PADDING: u8 = 0x00;
 
+    /// Length without the subtraction
+    fn marker_length(stream: &mut impl Iterator<Item = u8>, error: Error) -> Result<u16, Error> {
+        let x = stream.next().ok_or(error)?;
+        let y = stream.next().ok_or(error)?;
+
+        Ok(((x as u16) << 8) | (y as u16))
+    }
+
     fn marker(byte: u8) -> Option<Self> {
         match byte {
             0xD8 => Some(Self::SOI),
@@ -138,6 +178,7 @@ impl Marker {
             0xE0 => Some(Self::APP0),
             0xDB => Some(Self::DQT),
             0xC0 => Some(Self::SOF0),
+            0xC4 => Some(Self::DHT),
             0xDD => Some(Self::DRI),
             0xEE..=0xEF => Some(Self::APPN),
             _ => None,
@@ -153,6 +194,54 @@ impl Marker {
             //Self::Padding => Ok(()),
             Self::SOI => Ok(Outcome::None),
             Self::EOI => Ok(Outcome::EndOfImage),
+            Self::DHT => {
+                let error = Error::InvalidDHTMarker(DHTError::MissingNextByte);
+                fn throw(error: DHTError) -> Result<Outcome, Error> {
+                    return Err(Error::InvalidDHTMarker(error));
+                }
+
+                let mut length = (Self::marker_length(stream, error)? as i16) - 2;
+
+                while length > 0 {
+                    let table_info = stream.next().ok_or(error)?;
+                    let table_id = table_info & 0x0F;
+                    let is_ac = table_info >> 4 == 0x01;
+
+                    if table_id > 0x03 {
+                        return throw(DHTError::InvalidTableId);
+                    }
+
+                    let htable = if is_ac {
+                        &mut jpeg.huffman_tables_ac[table_id as usize]
+                    } else {
+                        &mut jpeg.huffman_tables_dc[table_id as usize]
+                    };
+
+                    let mut total_symbols = 0;
+
+                    for i in 1..17 {
+                        total_symbols += stream.next().ok_or(error)?;
+                        htable.offsets[i] = total_symbols;
+                    }
+
+                    if total_symbols > 0xA2 {
+                        return throw(DHTError::InvalidSymbolsLength);
+                    }
+
+                    for i in 0..total_symbols {
+                        htable.symbols[i as usize] = stream.next().ok_or(error)?;
+                    }
+
+                    htable.is_set = true;
+                    length -= 17 + (total_symbols as i16);
+                }
+
+                if length != 0 {
+                    return throw(DHTError::InvalidMarkerLength);
+                }
+
+                Ok(Outcome::HuffmanTable)
+            }
             Self::APPN => {
                 let error = Error::InvalidMarker;
                 let length = {
@@ -172,12 +261,7 @@ impl Marker {
             }
             Self::DRI => {
                 let error = Error::InvalidRestartIntervalMarker;
-                let length = {
-                    let x = stream.next().ok_or(error)?;
-                    let y = stream.next().ok_or(error)?;
-
-                    ((x as u16) << 8) | (y as u16)
-                };
+                let length = Self::marker_length(stream, error)?;
 
                 if length != 0x04 {
                     return Err(Error::InvalidRestartIntervalMarker);
@@ -205,12 +289,7 @@ impl Marker {
 
                 let error = Error::InvalidSOF0Marker(SOF0MarkerError::MissingNextByte);
 
-                let length = {
-                    let x = stream.next().ok_or(error)?;
-                    let y = stream.next().ok_or(error)?;
-
-                    ((x as i16) << 8) | (y as i16)
-                };
+                let length = Self::marker_length(stream, error)? as i16;
 
                 let precision = stream.next().ok_or(error)?; // Base line SOF0 always has 8 precision
                 if precision != 0x08 {
@@ -302,14 +381,7 @@ impl Marker {
             }
             Self::DQT => {
                 let error = Error::InvalidDQTMarker(DQTError::MissingNextByte);
-                let mut length = {
-                    let x = stream.next().ok_or(error)?;
-                    let y = stream.next().ok_or(error)?;
-
-                    let length = ((x as i16) << 8) | (y as i16);
-
-                    length - 2
-                };
+                let mut length = (Self::marker_length(stream, error)? as i16) - 2;
 
                 // Accumulate tables
                 while length > 0 {
@@ -368,11 +440,7 @@ impl Marker {
             Self::APP0 => {
                 let error = Error::InvalidAPP0Marker;
 
-                let l1 = stream.next().ok_or(error)?;
-                let l2 = stream.next().ok_or(error)?;
-
-                let length = ((l1 as i16) << 8) | (l2 as i16);
-                let mut length = length - 2;
+                let mut length = (Self::marker_length(stream, error)? as i16) - 2;
 
                 // Skip till 4th byte of identifier
                 for _ in 0..3 {
@@ -539,20 +607,54 @@ struct BaseLineSOF {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+struct HuffmanTable {
+    offsets: [u8; 17],
+    symbols: [u8; 162],
+    is_set: bool,
+}
+
+impl Default for HuffmanTable {
+    fn default() -> Self {
+        Self {
+            offsets: [0; 17],
+            symbols: [0; 162],
+            is_set: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Outcome {
     None,
     EndOfImage,
     QTableSet,
     StartOfFrame,
+    HuffmanTable,
 }
 
-#[derive(Clone, Debug, PartialEq, Default)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct JPEG {
     jfif: Option<APP0>,
     qtables: [QTable; 4],
     base_line_sof: BaseLineSOF,
     restart_interval: u16,
     zero_based_component_id: bool,
+    huffman_tables_dc: [HuffmanTable; 4],
+    huffman_tables_ac: [HuffmanTable; 4],
+}
+
+impl Default for JPEG {
+    fn default() -> Self {
+        Self {
+            jfif: None,
+            qtables: [QTable::default(); 4],
+            base_line_sof: BaseLineSOF::default(),
+            restart_interval: 0,
+            zero_based_component_id: false,
+            huffman_tables_dc: [HuffmanTable::default(); 4],
+            huffman_tables_ac: [HuffmanTable::default(); 4],
+        }
+    }
 }
 
 impl JPEG {
@@ -562,6 +664,7 @@ impl JPEG {
         let mut has_soi = false;
         let mut has_sof = false;
         let mut has_qtable = false;
+        let mut has_htable = false;
 
         // Advance until SOI
         while let Some(byte) = stream.next() {
@@ -581,14 +684,7 @@ impl JPEG {
             return Err(Error::NoData);
         }
 
-        // TODO: Might want to implement default for JPEG later
-        let mut jpeg = JPEG {
-            jfif: None,
-            qtables: [QTable::default(); 4],
-            base_line_sof: BaseLineSOF::default(),
-            restart_interval: 0,
-            zero_based_component_id: false,
-        };
+        let mut jpeg = JPEG::default();
 
         // Advance until next marker
         while let Some(byte) = stream.next() {
@@ -608,6 +704,9 @@ impl JPEG {
                         Outcome::QTableSet => {
                             has_qtable = true;
                         }
+                        Outcome::HuffmanTable => {
+                            has_htable = true;
+                        }
                         Outcome::None => {}
                     };
                 } else {
@@ -623,7 +722,9 @@ impl JPEG {
             return Err(Error::QTableNotFound);
         }
 
-        // need to check if at least 1 QTable is set
+        if !has_htable {
+            return Err(Error::HTableNotFound);
+        }
 
         Ok(jpeg)
     }
