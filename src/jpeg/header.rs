@@ -1,6 +1,7 @@
 use super::error::*;
 use std::{iter::Peekable, usize};
 
+#[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum Marker {
     SOI,
@@ -40,7 +41,7 @@ impl Marker {
         Ok(((x as u16) << 8) | (y as u16))
     }
 
-    fn marker(byte: u8) -> Option<Self> {
+    fn new(byte: u8) -> Option<Self> {
         match byte {
             0x01 => Some(Self::TEM),
             0xD8 => Some(Self::SOI),
@@ -102,14 +103,13 @@ impl Marker {
                 let error = Error::InvalidSOSMarker(SOSError::MissingNextByte);
 
                 fn throw(error: SOSError) -> Result<DecodingOutcome> {
-                    return Err(Error::InvalidSOSMarker(error));
+                    Err(Error::InvalidSOSMarker(error))
                 }
 
-                if jpeg
+                if !jpeg
                     .components
                     .iter()
-                    .find(|component| component.is_used_sof)
-                    .is_none()
+                    .any(|component| component.is_used_sof)
                 {
                     return throw(SOSError::InvalidOrder);
                 }
@@ -180,7 +180,7 @@ impl Marker {
             Self::DHT => {
                 let error = Error::InvalidDHTMarker(DHTError::MissingNextByte);
                 fn throw(error: DHTError) -> Result<DecodingOutcome> {
-                    return Err(Error::InvalidDHTMarker(error));
+                    Err(Error::InvalidDHTMarker(error))
                 }
 
                 let mut length = (Self::marker_length(stream, error)? as i16) - 2;
@@ -219,12 +219,11 @@ impl Marker {
                     length -= 17 + (total_symbols as i16);
                 }
 
-                if jpeg
+                if !jpeg
                     .huffman_tables_ac
                     .iter()
                     .chain(jpeg.huffman_tables_dc.iter())
-                    .find(|htable| htable.is_set)
-                    .is_none()
+                    .any(|htable| htable.is_set)
                 {
                     return throw(DHTError::NoTableSet);
                 }
@@ -260,7 +259,7 @@ impl Marker {
                 }
 
                 fn throw(error: SOF0MarkerError) -> Result<DecodingOutcome> {
-                    return Err(Error::InvalidSOF0Marker(error));
+                    Err(Error::InvalidSOF0Marker(error))
                 }
 
                 let error = Error::InvalidSOF0Marker(SOF0MarkerError::MissingNextByte);
@@ -302,7 +301,7 @@ impl Marker {
                 jpeg.height = height;
 
                 for _ in 0..component_number {
-                    let mut id = stream.next().ok_or(error)? as u8;
+                    let mut id = stream.next().ok_or(error)?;
 
                     if id == 0x00 {
                         jpeg.zero_based_component_id = true;
@@ -354,11 +353,10 @@ impl Marker {
                 }
 
                 //Make sure at least 1 component is set
-                if jpeg
+                if !jpeg
                     .components
                     .iter()
-                    .find(|component| component.is_used_sof)
-                    .is_none()
+                    .any(|component| component.is_used_sof)
                 {
                     return throw(SOF0MarkerError::NoComponentSet);
                 }
@@ -417,7 +415,7 @@ impl Marker {
                 }
 
                 // At least one QTable Must be set
-                if jpeg.qtables.iter().find(|table| table.is_set).is_none() {
+                if !jpeg.qtables.iter().any(|table| table.is_set) {
                     return Err(Error::InvalidDQTMarker(DQTError::NoTableSet));
                 }
 
@@ -551,7 +549,7 @@ impl Marker {
 
         println!("Reading 0x{:02X} marker", marker);
 
-        match Self::marker(marker) {
+        match Self::new(marker) {
             Some(marker) => {
                 if marker == Self::SOI {
                     return Err(Error::MultipleSOI);
