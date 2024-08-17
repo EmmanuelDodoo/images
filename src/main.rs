@@ -1,14 +1,14 @@
 mod jpeg;
-use jpeg::JPEG;
+use jpeg::JPEGHeader;
 
 fn main() {
     let image = "test.jpg";
 
     let stream = std::fs::read(image).unwrap();
 
-    match JPEG::new(stream) {
-        Ok(jpeg) => {
-            println!("{:?}", jpeg);
+    match JPEGHeader::new(stream) {
+        Ok(_jpeg_header) => {
+            println!("Done reading!");
         }
         Err(err) => {
             println!("{}", err)

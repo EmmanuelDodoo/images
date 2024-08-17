@@ -1,6 +1,6 @@
-#![allow(dead_code, unused_imports)]
+#![allow(unused_imports)]
 
-use std::{default, fmt::Display, marker, usize};
+use std::{default, fmt::Display, iter::Peekable, marker, usize};
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SOF0MarkerError {
@@ -142,8 +142,11 @@ pub enum Error {
     InvalidDHTMarker(DHTError),
     InvalidSOSMarker(SOSError),
     NoData,
-    DataAfterEOI,
     InvalidRestartIntervalMarker,
+    RestartMarkerBeforeSOS,
+    EndOfImageBeforeSOS,
+    PrematureEnd,
+    InvalidColorComponent,
 }
 
 impl Display for Error {
@@ -156,9 +159,11 @@ impl Display for Error {
                 Self::StartOfFrameNotFound => "JPEG has no Start of Frame marker".to_string(),
                 Self::QTableNotFound => "JPEG has no DQT marker".to_string(),
                 Self::HTableNotFound => "JPEG has no DHT marker".to_string(),
+                Self::InvalidColorComponent =>
+                    "A color component was not correctly set".to_string(),
                 Self::SOSNotFound => "JPEG has no SOS marker".to_string(),
                 Self::NoData => "No Data after Start of Image marker".to_string(),
-                Self::DataAfterEOI => "Data found after End of Image marker".to_string(),
+                Self::PrematureEnd => "The file ended prematurely".to_string(),
                 Self::InvalidMarker => "A 0xFF was found with no code after it".to_string(),
                 Self::InvalidAPP0Marker => "The APP0 marker has invalid data".to_string(),
                 Self::InvalidRestartIntervalMarker => "The DRI marker has invalid data".to_string(),
@@ -174,6 +179,10 @@ impl Display for Error {
                     format!("An unknown marker 0x{:04X} was encountered", marker),
                 Self::MultipleSOI => "Encountered multiple Start of Image markers".to_string(),
                 Self::MultipleSOF => "Encountered multiple Start of Frame markers".to_string(),
+                Self::RestartMarkerBeforeSOS =>
+                    "Encountered a Restart Marker before a Start of Scan marker".to_string(),
+                Self::EndOfImageBeforeSOS =>
+                    "Encountered an End of Image marker before a Start of Scan marker".to_string(),
             }
         )
     }
@@ -201,8 +210,19 @@ enum Marker {
     SOF0,
     DRI,
     APPN,
+    SOFN,
     DHT,
     SOS,
+    JPGEXT,
+    DAC,
+    RSTN,
+    DNL,
+    DHP,
+    EXP,
+    APP1,
+    JPG,
+    COM,
+    TEM,
 }
 
 impl Eq for Marker {}
@@ -210,7 +230,6 @@ impl Eq for Marker {}
 impl Marker {
     const HEX_SOI: u8 = 0xD8;
     const HEX_EOI: u8 = 0xD9;
-    const HEX_PADDING: u8 = 0x00;
 
     /// Length without the subtraction
     fn marker_length(stream: &mut impl Iterator<Item = u8>, error: Error) -> Result<u16, Error> {
@@ -222,33 +241,66 @@ impl Marker {
 
     fn marker(byte: u8) -> Option<Self> {
         match byte {
+            0x01 => Some(Self::TEM),
             0xD8 => Some(Self::SOI),
             0xD9 => Some(Self::EOI),
-            //0x00 => Some(Self::Padding),
             0xE0 => Some(Self::APP0),
             0xDB => Some(Self::DQT),
             0xC0 => Some(Self::SOF0),
             0xC4 => Some(Self::DHT),
             0xDD => Some(Self::DRI),
             0xDA => Some(Self::SOS),
-            0xEE..=0xEF => Some(Self::APPN),
+            0xC8 => Some(Self::JPGEXT),
+            0xCC => Some(Self::DAC),
+            0xC1..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCE..=0xCF => Some(Self::SOFN),
+            0xD0..=0xD7 => Some(Self::RSTN),
+            0xDC => Some(Self::DNL),
+            0xDE => Some(Self::DHP),
+            0xDF => Some(Self::EXP),
+            0xE1 => Some(Self::APP1),
+            0xE2..=0xEF => Some(Self::APPN),
+            0xF0..=0xFD => Some(Self::JPG),
+            0xFE => Some(Self::COM),
             _ => None,
         }
+    }
+
+    fn skip_sized_marker(stream: &mut impl Iterator<Item = u8>) -> Result<DecodingOutcome, Error> {
+        let error = Error::InvalidMarker;
+        let length = Self::marker_length(stream, error)? - 2;
+
+        for _ in 0..length {
+            stream.next();
+        }
+
+        Ok(DecodingOutcome::None)
     }
 
     fn process(
         &self,
         stream: &mut impl Iterator<Item = u8>,
-        jpeg: &mut JPEG,
-    ) -> Result<Outcome, Error> {
+        jpeg: &mut JPEGHeader,
+    ) -> Result<DecodingOutcome, Error> {
         match self {
             //Self::Padding => Ok(()),
-            Self::SOI => Ok(Outcome::None),
-            Self::EOI => Ok(Outcome::EndOfImage),
+            Self::TEM => Ok(DecodingOutcome::None),
+            Self::SOI => Ok(DecodingOutcome::None),
+            Self::EOI => Err(Error::EndOfImageBeforeSOS),
+            Self::RSTN => Err(Error::RestartMarkerBeforeSOS),
+            Self::APPN => Self::skip_sized_marker(stream),
+            Self::SOFN => Self::skip_sized_marker(stream),
+            Self::JPGEXT => Self::skip_sized_marker(stream),
+            Self::DAC => Self::skip_sized_marker(stream),
+            Self::DNL => Self::skip_sized_marker(stream),
+            Self::DHP => Self::skip_sized_marker(stream),
+            Self::EXP => Self::skip_sized_marker(stream),
+            Self::JPG => Self::skip_sized_marker(stream),
+            Self::COM => Self::skip_sized_marker(stream),
+            Self::APP1 => todo!("EXIF needs implementing"),
             Self::SOS => {
                 let error = Error::InvalidSOSMarker(SOSError::MissingNextByte);
 
-                fn throw(error: SOSError) -> Result<Outcome, Error> {
+                fn throw(error: SOSError) -> Result<DecodingOutcome, Error> {
                     return Err(Error::InvalidSOSMarker(error));
                 }
 
@@ -322,11 +374,11 @@ impl Marker {
                     return throw(SOSError::InvalidMarkerLength);
                 }
 
-                Ok(Outcome::StartOfScan)
+                Ok(DecodingOutcome::StartOfScan)
             }
             Self::DHT => {
                 let error = Error::InvalidDHTMarker(DHTError::MissingNextByte);
-                fn throw(error: DHTError) -> Result<Outcome, Error> {
+                fn throw(error: DHTError) -> Result<DecodingOutcome, Error> {
                     return Err(Error::InvalidDHTMarker(error));
                 }
 
@@ -380,24 +432,7 @@ impl Marker {
                     return throw(DHTError::InvalidMarkerLength);
                 }
 
-                Ok(Outcome::HuffmanTable)
-            }
-            Self::APPN => {
-                let error = Error::InvalidMarker;
-                let length = {
-                    let x = stream.next().ok_or(error)?;
-                    let y = stream.next().ok_or(error)?;
-
-                    let len = ((x as i16) << 8) | (y as i16);
-
-                    len - 2
-                };
-
-                for _ in 0..length {
-                    stream.next();
-                }
-
-                Ok(Outcome::None)
+                Ok(DecodingOutcome::HuffmanTable)
             }
             Self::DRI => {
                 let error = Error::InvalidRestartIntervalMarker;
@@ -416,14 +451,14 @@ impl Marker {
 
                 jpeg.restart_interval = rsi;
 
-                Ok(Outcome::None)
+                Ok(DecodingOutcome::None)
             }
             Self::SOF0 => {
                 if jpeg.is_sof_set {
                     return Err(Error::MultipleSOF);
                 }
 
-                fn throw(error: SOF0MarkerError) -> Result<Outcome, Error> {
+                fn throw(error: SOF0MarkerError) -> Result<DecodingOutcome, Error> {
                     return Err(Error::InvalidSOF0Marker(error));
                 }
 
@@ -527,7 +562,7 @@ impl Marker {
                     return throw(SOF0MarkerError::NoComponentSet);
                 }
 
-                Ok(Outcome::StartOfFrame)
+                Ok(DecodingOutcome::StartOfFrame)
             }
             Self::DQT => {
                 let error = Error::InvalidDQTMarker(DQTError::MissingNextByte);
@@ -585,7 +620,7 @@ impl Marker {
                     return Err(Error::InvalidDQTMarker(DQTError::NoTableSet));
                 }
 
-                Ok(Outcome::QTableSet)
+                Ok(DecodingOutcome::QTableSet)
             }
             Self::APP0 => {
                 let error = Error::InvalidAPP0Marker;
@@ -604,7 +639,7 @@ impl Marker {
                 if !is_extension {
                     if jpeg.jfif.is_some() {
                         dbg!("Multiple non-extension JFIF segment markers encountered!");
-                        return Ok(Outcome::None);
+                        return Ok(DecodingOutcome::None);
                     }
                     let major_version = stream.next().ok_or(error)?;
                     let minor_version = stream.next().ok_or(error)?;
@@ -662,16 +697,58 @@ impl Marker {
                     }
                 }
 
-                Ok(Outcome::None)
+                Ok(DecodingOutcome::None)
             }
         }
     }
 
-    fn read(stream: &mut impl Iterator<Item = u8>, jpeg: &mut JPEG) -> Result<Outcome, Error> {
-        // Guaranteed by check in JPEG::new
-        let marker = stream.next().unwrap();
+    fn scan<I>(stream: &mut Peekable<I>, jpeg: &mut JPEGHeader) -> Result<(), Error>
+    where
+        I: Iterator<Item = u8>,
+    {
+        loop {
+            match stream.next() {
+                None => return Err(Error::PrematureEnd),
+                Some(current) => {
+                    if current == 0xFF {
+                        let next = stream.peek();
 
-        println!("Reading {:04X} marker", marker);
+                        if next == Some(&Marker::HEX_EOI) {
+                            break;
+                        } else if next == Some(&0x00) {
+                            jpeg.huffman_data.push(current);
+                            stream.next();
+                        } else if &0xD0 <= next.ok_or(Error::PrematureEnd)?
+                            || next.ok_or(Error::PrematureEnd)? <= &0xD7
+                        {
+                            stream.next();
+                        }
+                    } else {
+                        jpeg.huffman_data.push(current);
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    fn read<I>(stream: &mut Peekable<I>, jpeg: &mut JPEGHeader) -> Result<DecodingOutcome, Error>
+    where
+        I: Iterator<Item = u8>,
+    {
+        // Skip repetitions of 0xFF
+        while let Some(marker) = stream.peek() {
+            if *marker != 0xFF {
+                break;
+            } else {
+                stream.next();
+            }
+        }
+
+        let marker = stream.next().ok_or(Error::InvalidMarker)?;
+
+        println!("Reading 0x{:02X} marker", marker);
 
         match Self::marker(marker) {
             Some(marker) => {
@@ -769,9 +846,8 @@ impl Default for HuffmanTable {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-enum Outcome {
+enum DecodingOutcome {
     None,
-    EndOfImage,
     QTableSet,
     StartOfFrame,
     HuffmanTable,
@@ -779,7 +855,7 @@ enum Outcome {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct JPEG {
+pub struct JPEGHeader {
     jfif: Option<APP0>,
     qtables: [QTable; 4],
     restart_interval: u16,
@@ -797,7 +873,7 @@ pub struct JPEG {
     huffman_data: Vec<u8>,
 }
 
-impl Default for JPEG {
+impl Default for JPEGHeader {
     fn default() -> Self {
         Self {
             jfif: None,
@@ -819,8 +895,8 @@ impl Default for JPEG {
     }
 }
 
-impl JPEG {
-    pub fn new(stream: Vec<u8>) -> Result<JPEG, Error> {
+impl JPEGHeader {
+    pub fn new(stream: Vec<u8>) -> Result<JPEGHeader, Error> {
         let mut stream = stream.into_iter();
 
         let mut has_soi = false;
@@ -847,34 +923,27 @@ impl JPEG {
             return Err(Error::NoData);
         }
 
-        let mut jpeg = JPEG::default();
+        let mut jpeg_header = JPEGHeader::default();
 
         // Advance until next marker
         while let Some(byte) = stream.next() {
             if byte == 0xFF {
                 if stream.peek().is_some() {
-                    match Marker::read(&mut stream, &mut jpeg)? {
-                        Outcome::EndOfImage => {
-                            if stream.peek().is_some() {
-                                return Err(Error::DataAfterEOI);
-                            } else {
-                                break;
-                            }
-                        }
-                        Outcome::StartOfFrame => {
+                    match Marker::read(&mut stream, &mut jpeg_header)? {
+                        DecodingOutcome::StartOfFrame => {
                             has_sof = true;
                         }
-                        Outcome::QTableSet => {
+                        DecodingOutcome::QTableSet => {
                             has_qtable = true;
                         }
-                        Outcome::HuffmanTable => {
+                        DecodingOutcome::HuffmanTable => {
                             has_htable = true;
                         }
-                        Outcome::StartOfScan => {
+                        DecodingOutcome::StartOfScan => {
                             has_sos = true;
-                             
+                            break;
                         }
-                        Outcome::None => {}
+                        DecodingOutcome::None => {}
                     };
                 } else {
                     return Err(Error::InvalidMarker);
@@ -897,6 +966,47 @@ impl JPEG {
             return Err(Error::SOSNotFound);
         }
 
-        Ok(jpeg)
+        Marker::scan(&mut stream, &mut jpeg_header)?;
+
+        // Last validations
+        for component in jpeg_header.components.iter() {
+            if (component.is_used_sos && !component.is_used_sof)
+                || (component.is_used_sof && !component.is_used_sos)
+            {
+                return Err(Error::InvalidColorComponent);
+            }
+
+            match jpeg_header
+                .huffman_tables_dc
+                .get(component.huffman_table_dc_id as usize)
+            {
+                Some(htable) => {
+                    if !htable.is_set {
+                        return Err(Error::InvalidColorComponent);
+                    }
+                }
+                None => return Err(Error::InvalidColorComponent),
+            }
+
+            match jpeg_header
+                .huffman_tables_ac
+                .get(component.huffman_table_ac_id as usize)
+            {
+                Some(htable) if !htable.is_set => return Err(Error::InvalidColorComponent),
+                None => return Err(Error::InvalidColorComponent),
+                _ => {}
+            }
+
+            match jpeg_header.qtables.get(component.qtable as usize) {
+                Some(qtable) => {
+                    if !qtable.is_set {
+                        return Err(Error::InvalidColorComponent);
+                    }
+                }
+                None => return Err(Error::InvalidColorComponent),
+            }
+        }
+
+        Ok(jpeg_header)
     }
 }

@@ -1,0 +1,11 @@
+Current Limitations:
+
+- Extended SOF not supported
+- Only 1,3 or 4 components  supported for SOF. More are ignored
+- Only component ids 1,2,3,4 supported
+
+- ignores APP2 - APP15
+
+- JFIFXX currently not supported
+
+- ignores any data after EOI
