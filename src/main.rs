@@ -2,7 +2,7 @@ mod jpeg;
 use jpeg::JPEGHeader;
 
 fn main() {
-    let image = "test.jpg";
+    let image = "cat.jpg";
 
     let stream = std::fs::read(image).unwrap();
 

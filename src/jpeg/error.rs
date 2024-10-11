@@ -124,6 +124,33 @@ impl Display for SOSError {
 impl error::Error for SOSError {}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub enum HuffmanDecodingError {
+    ReadPastLength,
+    SymbolNotFound,
+    InvalidDCCoefficientLength,
+    ZerosExceedMCULength,
+    InvalidACCoefficientLength,
+}
+
+impl Display for HuffmanDecodingError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}",
+            match self {
+                Self::ReadPastLength => "Entire Huffman bit stream read",
+                Self::SymbolNotFound => "Symbol not found after reading past 16 bits",
+                Self::InvalidDCCoefficientLength => "DC coefficient had length greater than 11",
+                Self::InvalidACCoefficientLength => "AC coefficient had length greater than 10",
+                Self::ZerosExceedMCULength => "AC Table Zeroes exceeded run length of MCU",
+            }
+        )
+    }
+}
+
+impl error::Error for HuffmanDecodingError {}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Error {
     StartOfImageNotFound,
     StartOfFrameNotFound,
@@ -145,6 +172,7 @@ pub enum Error {
     EndOfImageBeforeSOS,
     PrematureEnd,
     InvalidColorComponent,
+    HuffmanDecode(HuffmanDecodingError),
 }
 
 impl Display for Error {
@@ -181,6 +209,7 @@ impl Display for Error {
                     "Encountered a Restart Marker before a Start of Scan marker".to_string(),
                 Self::EndOfImageBeforeSOS =>
                     "Encountered an End of Image marker before a Start of Scan marker".to_string(),
+                Self::HuffmanDecode(source) => source.to_string(),
             }
         )
     }
@@ -195,6 +224,12 @@ impl error::Error for Error {
             Self::InvalidSOSMarker(source) => Some(source),
             _ => None,
         }
+    }
+}
+
+impl From<HuffmanDecodingError> for Error {
+    fn from(value: HuffmanDecodingError) -> Self {
+        Error::HuffmanDecode(value)
     }
 }
 

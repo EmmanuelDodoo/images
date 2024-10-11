@@ -1,5 +1,12 @@
+#![allow(dead_code, unused_imports, unused_variables)]
 use super::error::*;
 use std::{iter::Peekable, usize};
+
+const ZIGZAG: [u16; 64] = [
+    0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27, 20,
+    13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51, 58, 59,
+    52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
+];
 
 #[allow(clippy::upper_case_acronyms)]
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -118,7 +125,7 @@ impl Marker {
 
                 let component_number = stream.next().ok_or(error)?;
 
-                if component_number == 0x00 || component_number > 0x04 {
+                if component_number == 0x00 || component_number > 0x03 {
                     return throw(SOSError::InvalidComponentNumber);
                 }
 
@@ -129,7 +136,7 @@ impl Marker {
                         component_id += 1;
                     }
 
-                    if component_id > 0x04 {
+                    if component_id as usize > jpeg.components.len() {
                         return throw(SOSError::InvalidComponentID);
                     }
 
@@ -148,12 +155,15 @@ impl Marker {
                     if dc_id > 0x03 || ac_id > 0x03 {
                         return throw(SOSError::InvalidHuffmanTableID);
                     }
+
+                    component.huffman_table_dc_id = dc_id;
+                    component.huffman_table_ac_id = ac_id;
                 }
 
                 let selection_start = stream.next().ok_or(error)?;
                 let selection_end = stream.next().ok_or(error)?;
 
-                if selection_start > 0x3F || selection_end > 0x3F {
+                if selection_start != 0 || selection_end > 0x3F {
                     return throw(SOSError::InvalidSpectralSelection);
                 }
 
@@ -164,7 +174,7 @@ impl Marker {
                 let high = approximation >> 4;
                 let low = approximation & 0x0F;
 
-                if high > 13 {
+                if high != 0 || low != 0 {
                     return throw(SOSError::InvalidSuccesiveApproximation);
                 }
 
@@ -390,14 +400,14 @@ impl Marker {
                             let x = stream.next().ok_or(error)?;
                             let y = stream.next().ok_or(error)?;
 
-                            data[QTable::ZIGZAG[i] as usize] = ((x as u16) << 8) | (y as u16);
+                            data[ZIGZAG[i] as usize] = ((x as u16) << 8) | (y as u16);
                         }
 
                         length -= 128;
                     } else {
                         for i in 0..64 {
                             let byte = stream.next().ok_or(error)?;
-                            data[QTable::ZIGZAG[i] as usize] = byte as u16;
+                            data[ZIGZAG[i] as usize] = byte as u16;
                         }
 
                         length -= 64;
@@ -547,7 +557,7 @@ impl Marker {
 
         let marker = stream.next().ok_or(Error::InvalidMarker)?;
 
-        println!("Reading 0x{:02X} marker", marker);
+        //println!("Reading 0x{:02X} marker", marker);
 
         match Self::new(marker) {
             Some(marker) => {
@@ -596,14 +606,6 @@ struct QTable {
     table: [u16; 64],
 }
 
-impl QTable {
-    const ZIGZAG: [u16; 64] = [
-        0, 1, 8, 16, 9, 2, 3, 10, 17, 24, 32, 25, 18, 11, 4, 5, 12, 19, 26, 33, 40, 48, 41, 34, 27,
-        20, 13, 6, 7, 14, 21, 28, 35, 42, 49, 56, 57, 50, 43, 36, 29, 22, 15, 23, 30, 37, 44, 51,
-        58, 59, 52, 45, 38, 31, 39, 46, 53, 60, 61, 54, 47, 55, 62, 63,
-    ];
-}
-
 impl Default for QTable {
     fn default() -> Self {
         Self {
@@ -631,6 +633,7 @@ struct ColorComponent {
 struct HuffmanTable {
     offsets: [u8; 17],
     symbols: [u8; 162],
+    codes: [u32; 162],
     is_set: bool,
 }
 
@@ -639,7 +642,26 @@ impl Default for HuffmanTable {
         Self {
             offsets: [0; 17],
             symbols: [0; 162],
+            codes: [0; 162],
             is_set: false,
+        }
+    }
+}
+
+impl HuffmanTable {
+    fn generate_codes(&mut self) {
+        let mut code = 0;
+
+        for i in 0..16 {
+            let current = self.offsets[i];
+            let next = self.offsets[i + 1];
+
+            for c in current..next {
+                self.codes[c as usize] = code;
+                code += 1;
+            }
+
+            code = code << 1;
         }
     }
 }
@@ -653,6 +675,86 @@ enum DecodingOutcome {
     StartOfScan,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct MCU {
+    r: [i32; 64],
+    g: [i32; 64],
+    b: [i32; 64],
+    is_rbg: bool,
+}
+
+impl MCU {
+    fn component(&mut self, index: usize) -> &mut [i32; 64] {
+        match index {
+            0 => &mut self.r,
+            1 => &mut self.g,
+            2 => &mut self.b,
+            _ => panic!("Invalid MCU component index"),
+        }
+    }
+}
+
+impl Default for MCU {
+    fn default() -> Self {
+        Self {
+            r: [0; 64],
+            g: [0; 64],
+            b: [0; 64],
+            is_rbg: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BitReader<'a> {
+    data: &'a [u8],
+    bit_position: usize,
+    byte_position: usize,
+}
+
+impl<'a> BitReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            data,
+            bit_position: 0,
+            byte_position: 0,
+        }
+    }
+
+    fn read_length(&mut self, length: u8) -> Option<u32> {
+        let mut output = 0;
+
+        for _ in 0..length {
+            let bit = self.read_bit()?;
+            output = (output << 1) | bit;
+        }
+
+        Some(output)
+    }
+
+    fn read_bit(&mut self) -> Option<u32> {
+        let byte = self.data.get(self.byte_position)?;
+
+        // Read bit from most to least significant
+        let bit = ((byte >> (7 - self.bit_position)) & 1) as u32;
+        self.bit_position += 1;
+
+        if self.bit_position == 8 {
+            self.bit_position = 0;
+            self.byte_position += 1;
+        }
+
+        Some(bit)
+    }
+
+    fn align(&mut self) {
+        if self.byte_position < self.data.len() && self.bit_position != 0 {
+            self.bit_position = 0;
+            self.byte_position += 1;
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct JPEGHeader {
     jfif: Option<APP0>,
@@ -661,7 +763,7 @@ pub struct JPEGHeader {
     zero_based_component_id: bool,
     huffman_tables_dc: [HuffmanTable; 4],
     huffman_tables_ac: [HuffmanTable; 4],
-    components: [ColorComponent; 4],
+    components: [ColorComponent; 3],
     is_sof_set: bool,
     height: u16,
     width: u16,
@@ -681,7 +783,7 @@ impl Default for JPEGHeader {
             zero_based_component_id: false,
             huffman_tables_dc: [HuffmanTable::default(); 4],
             huffman_tables_ac: [HuffmanTable::default(); 4],
-            components: [ColorComponent::default(); 4],
+            components: [ColorComponent::default(); 3],
             is_sof_set: false,
             height: 0,
             width: 0,
@@ -806,6 +908,180 @@ impl JPEGHeader {
             }
         }
 
+        jpeg_header.decode_huffman()?;
+
+        //println!("{:?}", jpeg_header.huffman_data.len());
+
+        //{
+        //    println!("Start of Selection: {:?}", jpeg_header.start_of_selection);
+        //    println!("End of Selection: {:?}", jpeg_header.end_of_selection);
+        //    println!(
+        //        "Successive high: {:?}",
+        //        jpeg_header.successive_approximation_high
+        //    );
+        //    println!(
+        //        "Successive low: {:?}",
+        //        jpeg_header.successive_approximation_low
+        //    );
+        //    println!("Color Components");
+        //
+        //    for component in &jpeg_header.components {
+        //        println!("Component ID: {:?}", component.id);
+        //        println!(
+        //            "Component DC Huffman ID: {:?}",
+        //            component.huffman_table_dc_id
+        //        );
+        //        println!(
+        //            "Component AC Huffman ID: {:?}",
+        //            component.huffman_table_ac_id
+        //        );
+        //    }
+        //
+        //    println!("Huffman Size: {:?}", jpeg_header.huffman_data.len());
+        //    println!("Restart Interval: {:?}", jpeg_header.restart_interval);
+        //}
+
         Ok(jpeg_header)
+    }
+
+    fn decode_huffman(&mut self) -> Result<Vec<MCU>> {
+        let mcu_height = (self.height + 7) / 8;
+        let mcu_width = (self.width + 7) / 8;
+
+        let mut mcus = vec![MCU::default(); (mcu_height * mcu_width) as usize];
+
+        for i in 0..4 {
+            if let Some(table) = self.huffman_tables_dc.get_mut(i) {
+                if table.is_set {
+                    table.generate_codes();
+                }
+            };
+
+            if let Some(table) = self.huffman_tables_ac.get_mut(i) {
+                if table.is_set {
+                    table.generate_codes();
+                }
+            };
+        }
+
+        let mut bit_reader = BitReader::new(&self.huffman_data);
+
+        let mut previous_dc = [0; 3];
+
+        for i in 0..(mcu_height * mcu_width) {
+            // Restart intervals
+            if self.restart_interval != 0 && i % self.restart_interval == 0 {
+                previous_dc = [0; 3];
+                bit_reader.align();
+            }
+
+            for j in 0..self.components.len() {
+                Self::decode_mcus(
+                    &mut bit_reader,
+                    mcus[i as usize].component(j),
+                    &mut previous_dc[j],
+                    &self.huffman_tables_dc[self.components[j].huffman_table_dc_id as usize],
+                    &self.huffman_tables_ac[self.components[j].huffman_table_ac_id as usize],
+                )?;
+            }
+        }
+
+        Ok(mcus)
+    }
+
+    fn decode_mcus(
+        reader: &mut BitReader,
+        component: &mut [i32; 64],
+        previous_dc: &mut i32,
+        dc_table: &HuffmanTable,
+        ac_table: &HuffmanTable,
+    ) -> Result<()> {
+        let length = Self::get_next_symbol(reader, dc_table)?;
+
+        // DC cannot be more than 11
+        if length > 11 {
+            return Err(HuffmanDecodingError::InvalidDCCoefficientLength)?;
+        }
+
+        let mut dc_coeff = reader
+            .read_length(length)
+            .ok_or(HuffmanDecodingError::ReadPastLength)? as i32;
+
+        if length != 0 && dc_coeff < (1 << (length - 1)) {
+            dc_coeff -= (1 << length) - 1;
+        }
+
+        component[0] = dc_coeff + *previous_dc;
+        *previous_dc = component[0];
+
+        // AC now
+        let mut i = 1;
+
+        while i < 64 {
+            let symbol = Self::get_next_symbol(reader, ac_table)?;
+
+            // 0x00 means fill the remaining with 0
+            if symbol == 0x00 {
+                return Ok(());
+            }
+
+            let mut skip_zeros = symbol >> 4;
+            let coeff_len = symbol & 0x0F;
+
+            if symbol == 0xF0 {
+                skip_zeros = 16;
+            }
+
+            if (i + skip_zeros as usize) >= 64 {
+                println!("i:{i}, zeros:{skip_zeros:?}, len:{coeff_len}");
+                return Err(HuffmanDecodingError::ZerosExceedMCULength)?;
+            }
+
+            for _ in 0..skip_zeros {
+                component[ZIGZAG[i] as usize] = 0;
+                i += 1;
+            }
+
+            // Invalid for AC
+            if coeff_len > 10 {
+                return Err(HuffmanDecodingError::InvalidACCoefficientLength)?;
+            }
+
+            if coeff_len != 0 {
+                let mut ac_coeff = reader
+                    .read_length(coeff_len)
+                    .ok_or(HuffmanDecodingError::ReadPastLength)?
+                    as i32;
+
+                if ac_coeff < (1 << (coeff_len - 1)) {
+                    ac_coeff -= (1 << coeff_len) - 1;
+                }
+
+                component[ZIGZAG[i] as usize] = ac_coeff;
+                i += 1;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn get_next_symbol(reader: &mut BitReader, table: &HuffmanTable) -> Result<u8> {
+        let mut code = 0;
+
+        for i in 0..16 {
+            let bit = reader
+                .read_bit()
+                .ok_or(HuffmanDecodingError::ReadPastLength)?;
+
+            code = (code << 1) | bit;
+
+            for j in table.offsets[i]..table.offsets[i + 1] {
+                if code == table.codes[j as usize] {
+                    return Ok(table.symbols[j as usize]);
+                }
+            }
+        }
+
+        Err(HuffmanDecodingError::SymbolNotFound)?
     }
 }
